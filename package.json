@@ -2,7 +2,7 @@
   "name": "vless-lite",
   "version": "1.0.0",
   "description": "Lite VLESS for 100MB RAM",
-  "main": "app.js",
+  "main": "index.js",
   "scripts": {
     "start": "node --max-old-space-size=40 index.js"
   },
