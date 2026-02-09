@@ -8,9 +8,9 @@ const { spawn } = require('child_process');
 // 必填：你的 UUID
 const UUID = process.env.UUID || '0dff8b4c-f778-4648-8817-3a434f7fa443';
 // 必填：Cloudflare Tunnel Token
-const ARGO_AUTH = process.env.ARGO_AUTH || ''; 
+const ARGO_AUTH = process.env.ARGO_AUTH || 'eyJhIjoiMDU5NDkzODljMmM3YTZkNGJiNjU5OTU2MThhN2FiYzAiLCJ0IjoiYjAyNmM2ZTctODRiZi00YjRlLTkwZmMtNDRjMGFmYzBlMGQ1IiwicyI6Ik0yTXlZMkk0TkdVdE5tTTJZUzAwWkdOaExUZzFZV1l0WldVME5qSmlaR0V6WkdVNCJ9'; 
 // 必填：你的域名 (用于生成链接)
-const ARGO_DOMAIN = process.env.ARGO_DOMAIN || '';
+const ARGO_DOMAIN = process.env.ARGO_DOMAIN || 'flootup.wow83168.de5.net';
 
 const PORT = process.env.PORT || 3000; 
 // 必须优先使用 process.env.PORT
