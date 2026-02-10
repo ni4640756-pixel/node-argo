@@ -2,135 +2,96 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
+const net = require('net');
 
-// ================= 环境变量配置 =================
-// 必填：你的 UUID
+// ================= 1. 配置 =================
 const UUID = process.env.UUID || '0dff8b4c-f778-4648-8817-3a434f7fa443';
-// 必填：Cloudflare Tunnel Token
-const ARGO_AUTH = process.env.ARGO_AUTH || 'eyJhIjoiMDU5NDkzODljMmM3YTZkNGJiNjU5OTU2MThhN2FiYzAiLCJ0IjoiYjAyNmM2ZTctODRiZi00YjRlLTkwZmMtNDRjMGFmYzBlMGQ1IiwicyI6Ik0yTXlZMkk0TkdVdE5tTTJZUzAwWkdOaExUZzFZV1l0WldVME5qSmlaR0V6WkdVNCJ9'; 
-// 必填：你的域名 (用于生成链接)
-const ARGO_DOMAIN = process.env.ARGO_DOMAIN || 'flootup.wow83168.de5.net';
+// 必须监听这个环境变量提供的端口！
+const PORT = process.env.PORT || 8080; 
+// Xray 在内部监听的端口 (不对外)
+const INTERNAL_PORT = 12345; 
 
-const PORT = process.env.PORT || 3000; 
-// 必须优先使用 process.env.PORT
-const FILE_PATH = './tmp';
+const APP_DIR = path.join(__dirname, 'sap_app');
+if (!fs.existsSync(APP_DIR)) fs.mkdirSync(APP_DIR);
 
-// ================= 初始化目录 =================
-if (!fs.existsSync(FILE_PATH)) fs.mkdirSync(FILE_PATH);
-
-// ================= 1. 极简 HTTP 服务 (替代 Express) =================
-// 只有 10 行代码，内存占用极低
+// ================= 2. 核心：Node.js 流量分发器 =================
 const server = http.createServer((req, res) => {
-  if (req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('VLESS Worker is Alive.\n');
-  } else {
-    res.writeHead(404);
-    res.end();
-  }
+    // A. 普通网页请求 (健康检查) -> 返回 200
+    if (req.url === '/') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end('<h1>SAP Direct is Running</h1>');
+    } else {
+        res.writeHead(200);
+        res.end('OK');
+    }
+});
+
+// B. WebSocket 升级请求 (VLESS 流量) -> 转发给 Xray
+server.on('upgrade', (req, socket, head) => {
+    if (req.url == '/vless') { // 路径匹配
+        // 连接内部的 Xray
+        const client = net.createConnection({ port: INTERNAL_PORT }, () => {
+            client.write(head);
+            socket.pipe(client);
+            client.pipe(socket);
+        });
+        
+        client.on('error', (err) => {
+            socket.destroy();
+        });
+    } else {
+        socket.destroy();
+    }
 });
 
 server.listen(PORT, () => {
-  console.log(`Lite Server running on port ${PORT}`);
-  startService(); // 服务启动后，开始下载和运行节点
+    console.log(`[Node] Listening on port ${PORT}`);
+    startXray();
 });
 
-// ================= 2. 核心逻辑 =================
-async function startService() {
-  const webPath = path.join(FILE_PATH, 'web'); // xray/sing-box
-  const botPath = path.join(FILE_PATH, 'bot'); // cloudflared
-  const configPath = path.join(FILE_PATH, 'config.json');
+// ================= 3. 启动 Xray (内部模式) =================
+async function startXray() {
+    const coreBin = path.join(APP_DIR, 'web');
+    const configFile = path.join(APP_DIR, 'config.json');
 
-  // A. 下载依赖 (原生 https，不依赖 axios)
-  await downloadFile(`https://${getArch()}.ssss.nyc.mn/web`, webPath);
-  await downloadFile(`https://${getArch()}.ssss.nyc.mn/bot`, botPath);
+    // 下载 Xray
+    const arch = ['arm', 'arm64', 'aarch64'].includes(process.arch) ? 'arm64' : 'amd64';
+    await download(`https://${arch}.ssss.nyc.mn/web`, coreBin);
+    
+    // 赋权
+    try { fs.chmodSync(coreBin, 0o755); } catch (e) { try { execSync(`chmod +x ${coreBin}`); } catch (e) {} }
 
-  // B. 生成 VLESS 配置 (监听 8080)
-  const config = {
-    log: { loglevel: "none" },
-    inbounds: [{
-      port: 8080,
-      listen: "127.0.0.1",
-      protocol: "vless",
-      settings: { clients: [{ id: UUID }], decryption: "none" },
-      streamSettings: { network: "ws", wsSettings: { path: "/vless" } }
-    }],
-    outbounds: [{ protocol: "freedom" }]
-  };
-  fs.writeFileSync(configPath, JSON.stringify(config));
+    // 生成配置：注意！这里监听的是 INTERNAL_PORT (12345)
+    const config = {
+        log: { loglevel: "none" }, // 关闭日志省内存
+        inbounds: [{
+            port: INTERNAL_PORT,
+            listen: "127.0.0.1",
+            protocol: "vless",
+            settings: { clients: [{ id: UUID }], decryption: "none" },
+            streamSettings: { network: "ws", wsSettings: { path: "/vless" } }
+        }],
+        outbounds: [{ protocol: "freedom" }]
+    };
+    fs.writeFileSync(configFile, JSON.stringify(config));
 
-  // C. 启动进程 (关键！内存锁)
-  // Xray/Sing-box: 限制 25MB
-  runProcess(webPath, ['-c', configPath], 'Core', '25MiB');
-
-  // Cloudflared: 限制 40MB
-  if (ARGO_AUTH) {
-    runProcess(botPath, 
-      ['tunnel', '--edge-ip-version', 'auto', '--no-autoupdate', '--protocol', 'http2', 'run', '--token', ARGO_AUTH], 
-      'Tunnel', '40MiB'
-    );
-  } else {
-    console.log('❌ 未检测到 ARGO_AUTH，隧道无法启动！');
-  }
-
-  // D. 打印订阅链接
-  setTimeout(() => {
-    console.log('\n=======================================');
-    console.log(`🔗 VLESS 链接:`);
-    console.log(`vless://${UUID}@www.visa.com.sg:443?encryption=none&security=tls&sni=${ARGO_DOMAIN}&type=ws&host=${ARGO_DOMAIN}&path=%2Fvless#Node-100MB`);
-    console.log('=======================================\n');
-  }, 5000);
-}
-
-// ================= 辅助函数 =================
-
-// 1. 进程启动器 (带 GOMEMLIMIT)
-function runProcess(command, args, name, memLimit) {
-  // 设置权限
-  try { fs.chmodSync(command, 0o775); } catch (e) {}
-
-  const child = spawn(command, args, {
-    stdio: 'inherit', // 直接输出日志到控制台，不缓存
-    env: {
-      ...process.env,
-      GOGC: '10',         // 激进回收：垃圾增加 10% 就回收
-      GOMEMLIMIT: memLimit // 硬限：超过这个值强制 GC，绝不溢出
-    }
-  });
-
-  console.log(`🚀 ${name} started with limit: ${memLimit}`);
-  
-  child.on('exit', (code) => {
-    console.log(`⚠️ ${name} exited with code ${code}`);
-    // 如果核心进程挂了，杀掉整个容器重启，防止僵尸进程
-    process.exit(1);
-  });
-}
-
-// 2. 原生下载器
-function downloadFile(url, dest) {
-  return new Promise((resolve, reject) => {
-    if (fs.existsSync(dest)) {
-      console.log(`[Skip] ${path.basename(dest)} exists.`);
-      return resolve();
-    }
-    console.log(`[Down] Downloading ${path.basename(dest)}...`);
-    const file = fs.createWriteStream(dest);
-    https.get(url, (response) => {
-      response.pipe(file);
-      file.on('finish', () => {
-        file.close(resolve);
-      });
-    }).on('error', (err) => {
-      fs.unlink(dest, () => {});
-      reject(err.message);
+    // 启动 (限制内存 50MB)
+    const xray = spawn(coreBin, ['-c', configFile], {
+        stdio: 'inherit',
+        env: { ...process.env, GOMEMLIMIT: '50MiB' }
     });
-  });
+    
+    console.log(`[Xray] Started on internal port ${INTERNAL_PORT}`);
 }
 
-// 3. 架构判断
-function getArch() {
-  const arch = process.arch;
-  return ['arm', 'arm64', 'aarch64'].includes(arch) ? 'arm64' : 'amd64';
+function download(url, dest) {
+    return new Promise((resolve) => {
+        if (fs.existsSync(dest)) return resolve();
+        const file = fs.createWriteStream(dest);
+        https.get(url, (res) => {
+            res.pipe(file);
+            file.on('finish', () => file.close(resolve));
+        }).on('error', () => resolve());
+    });
 }
