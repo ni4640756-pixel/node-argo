@@ -5,41 +5,55 @@ const path = require('path');
 const { spawn, execSync } = require('child_process');
 const net = require('net');
 
-// ================= 1. 配置 =================
+// ================= 1. 配置区域 =================
 const UUID = process.env.UUID || '0dff8b4c-f778-4648-8817-3a434f7fa443';
-// 必须监听这个环境变量提供的端口！
 const PORT = process.env.PORT || 8080; 
-// Xray 在内部监听的端口 (不对外)
 const INTERNAL_PORT = 12345; 
-
 const APP_DIR = path.join(__dirname, 'sap_app');
+
+// ================= 2. 初始化环境 =================
 if (!fs.existsSync(APP_DIR)) fs.mkdirSync(APP_DIR);
 
-// ================= 2. 核心：Node.js 流量分发器 =================
+// ================= 3. 核心 Web 服务 (带订阅功能) =================
 const server = http.createServer((req, res) => {
-    // A. 普通网页请求 (健康检查) -> 返回 200
+    
+    // 自动获取访问的域名 (关键!)
+    const host = req.headers.host;
+    const vlessLink = `vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=%2Fvless#SAP-Direct-${host.split('.')[0]}`;
+
+    // A. 首页：直接显示链接，方便手动复制
     if (req.url === '/') {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('<h1>SAP Direct is Running</h1>');
-    } else {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.write(`<h3>SAP VLESS Direct Mode</h3>`);
+        res.write(`<p>你的域名是: <strong>${host}</strong></p>`);
+        res.write(`<hr/>`);
+        res.write(`<h4>🚀 VLESS 链接 (点击全选复制):</h4>`);
+        res.write(`<textarea style="width:100%; height:100px;">${vlessLink}</textarea>`);
+        res.write(`<p>或者将本页面地址后面加上 <code>/sub</code> 作为订阅地址。</p>`);
+        res.end();
+    } 
+    // B. 订阅页：返回 Base64 编码 (标准的订阅格式)
+    else if (req.url === '/sub') {
+        const base64Content = Buffer.from(vlessLink).toString('base64');
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end(base64Content);
+    }
+    // C. 健康检查 (Keep-Alive)
+    else {
         res.writeHead(200);
         res.end('OK');
     }
 });
 
-// B. WebSocket 升级请求 (VLESS 流量) -> 转发给 Xray
+// WebSocket 流量转发 (直连核心)
 server.on('upgrade', (req, socket, head) => {
-    if (req.url == '/vless') { // 路径匹配
-        // 连接内部的 Xray
+    if (req.url == '/vless') {
         const client = net.createConnection({ port: INTERNAL_PORT }, () => {
             client.write(head);
             socket.pipe(client);
             client.pipe(socket);
         });
-        
-        client.on('error', (err) => {
-            socket.destroy();
-        });
+        client.on('error', (err) => socket.destroy());
     } else {
         socket.destroy();
     }
@@ -50,21 +64,17 @@ server.listen(PORT, () => {
     startXray();
 });
 
-// ================= 3. 启动 Xray (内部模式) =================
+// ================= 4. 启动 Xray =================
 async function startXray() {
     const coreBin = path.join(APP_DIR, 'web');
     const configFile = path.join(APP_DIR, 'config.json');
-
-    // 下载 Xray
     const arch = ['arm', 'arm64', 'aarch64'].includes(process.arch) ? 'arm64' : 'amd64';
+
     await download(`https://${arch}.ssss.nyc.mn/web`, coreBin);
-    
-    // 赋权
     try { fs.chmodSync(coreBin, 0o755); } catch (e) { try { execSync(`chmod +x ${coreBin}`); } catch (e) {} }
 
-    // 生成配置：注意！这里监听的是 INTERNAL_PORT (12345)
     const config = {
-        log: { loglevel: "none" }, // 关闭日志省内存
+        log: { loglevel: "none" },
         inbounds: [{
             port: INTERNAL_PORT,
             listen: "127.0.0.1",
@@ -76,13 +86,11 @@ async function startXray() {
     };
     fs.writeFileSync(configFile, JSON.stringify(config));
 
-    // 启动 (限制内存 50MB)
-    const xray = spawn(coreBin, ['-c', configFile], {
+    spawn(coreBin, ['-c', configFile], {
         stdio: 'inherit',
         env: { ...process.env, GOMEMLIMIT: '50MiB' }
     });
-    
-    console.log(`[Xray] Started on internal port ${INTERNAL_PORT}`);
+    console.log(`[Xray] Core Started.`);
 }
 
 function download(url, dest) {
